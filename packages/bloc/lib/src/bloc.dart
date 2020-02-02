@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:meta/meta.dart';
-import 'package:rxdart/rxdart.dart';
 
 import '../bloc.dart';
 
@@ -10,23 +9,23 @@ import '../bloc.dart';
 /// and transforms them into a `Stream` of `States` as output.
 /// {@endtemplate}
 abstract class Bloc<Event, State> extends Stream<State> implements Sink<Event> {
-  final PublishSubject<Event> _eventSubject = PublishSubject<Event>();
+  final _eventController = StreamController<Event>.broadcast();
 
-  BehaviorSubject<State> _stateSubject;
+  _StateController<State> _stateController;
 
   /// Returns the current [state] of the [bloc].
-  State get state => _stateSubject.value;
+  State get state => _stateController.value;
 
   /// Returns the [state] before any `events` have been [add]ed.
   State get initialState;
 
   /// Returns whether the `Stream<State>` is a broadcast stream.
   @override
-  bool get isBroadcast => _stateSubject.isBroadcast;
+  bool get isBroadcast => _stateController.isBroadcast;
 
   /// {@macro bloc}
   Bloc() {
-    _stateSubject = BehaviorSubject<State>.seeded(initialState);
+    _stateController = _StateController<State>.seeded(initialState);
     _bindStateSubject();
   }
 
@@ -41,7 +40,7 @@ abstract class Bloc<Event, State> extends Stream<State> implements Sink<Event> {
     void Function() onDone,
     bool cancelOnError,
   }) {
-    return _stateSubject.listen(
+    return _stateController.listen(
       onData,
       onError: onError,
       onDone: onDone,
@@ -77,7 +76,7 @@ abstract class Bloc<Event, State> extends Stream<State> implements Sink<Event> {
     try {
       BlocSupervisor.delegate.onEvent(this, event);
       onEvent(event);
-      _eventSubject.sink.add(event);
+      _eventController.sink.add(event);
     } on dynamic catch (error) {
       _handleError(error);
     }
@@ -93,8 +92,8 @@ abstract class Bloc<Event, State> extends Stream<State> implements Sink<Event> {
   @override
   @mustCallSuper
   Future<void> close() async {
-    await _eventSubject.close();
-    await _stateSubject.close();
+    await _eventController.close();
+    await _stateController.close();
   }
 
   /// Transforms the [events] stream along with a [next] function into
@@ -160,12 +159,12 @@ abstract class Bloc<Event, State> extends Stream<State> implements Sink<Event> {
   void _bindStateSubject() {
     Event currentEvent;
 
-    transformStates(transformEvents(_eventSubject, (event) {
+    transformStates(transformEvents(_eventController.stream, (event) {
       currentEvent = event;
       return mapEventToState(currentEvent).handleError(_handleError);
     })).forEach(
       (nextState) {
-        if (state == nextState || _stateSubject.isClosed) return;
+        if (state == nextState || _stateController.isClosed) return;
         final transition = Transition(
           currentState: state,
           event: currentEvent,
@@ -174,7 +173,7 @@ abstract class Bloc<Event, State> extends Stream<State> implements Sink<Event> {
         try {
           BlocSupervisor.delegate.onTransition(this, transition);
           onTransition(transition);
-          _stateSubject.add(nextState);
+          _stateController.add(nextState);
         } on dynamic catch (error) {
           _handleError(error);
         }
@@ -186,4 +185,80 @@ abstract class Bloc<Event, State> extends Stream<State> implements Sink<Event> {
     BlocSupervisor.delegate.onError(this, error, stacktrace);
     onError(error, stacktrace);
   }
+}
+
+class _StateController<State> {
+  final _controller = StreamController<State>.broadcast();
+
+  State _value;
+
+  State get value => _value;
+
+  _StateController.seeded(State initialState) {
+    _value = initialState;
+    _controller.add(initialState);
+  }
+
+  StreamSubscription<State> listen(
+    void Function(State) onData, {
+    Function onError,
+    void Function() onDone,
+    bool cancelOnError,
+  }) {
+    return _controller.stream
+        .transform(_StartWithStreamTransformer(_value))
+        .listen(
+          onData,
+          onError: onError,
+          onDone: onDone,
+          cancelOnError: cancelOnError,
+        );
+  }
+
+  void add(State state) {
+    _value = state;
+    _controller.add(state);
+  }
+
+  bool get isBroadcast => _controller.stream.isBroadcast;
+
+  bool get isClosed => _controller.isClosed;
+
+  Future<void> close() => _controller.close();
+}
+
+class _StartWithStreamTransformer<State>
+    extends StreamTransformerBase<State, State> {
+  final StreamTransformer<State, State> _transformer;
+
+  _StartWithStreamTransformer(State startValue)
+      : _transformer = StreamTransformer<State, State>((input, cancelOnError) {
+          StreamController<State> controller;
+          StreamSubscription<State> subscription;
+
+          controller = StreamController<State>(
+              sync: true,
+              onListen: () {
+                try {
+                  controller.add(startValue);
+                } on dynamic catch (e, s) {
+                  controller.addError(e, s);
+                }
+
+                subscription = input.listen(
+                  controller.add,
+                  onError: controller.addError,
+                  onDone: controller.close,
+                  cancelOnError: cancelOnError,
+                );
+              },
+              onPause: ([resumeSignal]) => subscription.pause(resumeSignal),
+              onResume: () => subscription.resume(),
+              onCancel: () => subscription.cancel());
+
+          return controller.stream.listen(null);
+        });
+
+  @override
+  Stream<State> bind(Stream<State> stream) => _transformer.bind(stream);
 }
